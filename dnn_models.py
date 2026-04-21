@@ -1,3 +1,18 @@
+"""Módulo de modelos DNN usados pelo experimento SincNet.
+
+Este módulo fornece implementações e utilitários para construir redes
+neurais aplicadas a sinais de áudio, incluindo:
+
+- Funções utilitárias: `flip`, `sinc`.
+- Camada `sinc_conv`: convolução parametrizada por filtros sinc (inicialização Mel).
+- Função `act_fun`: mapeia nomes de ativação para objetos PyTorch.
+- `LayerNorm`: normalização por camada simples com parâmetros treináveis.
+- `MLP`: perceptron multicamada configurável por um dicionário de opções.
+- `SincNet`: pilha de camadas convolucionais usada para extração de features do áudio.
+
+As docstrings em cada função/classe explicam parâmetros, retornos e propósito.
+"""
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -7,7 +22,18 @@ from torch.autograd import Variable
 import math
 
 def flip(x, dim):
-    xsize = x.size()
+  """Inverte um tensor ao longo da dimensão especificada.
+
+  Suporta dimensões negativas (como no padrão do PyTorch).
+
+  Args:
+    x (torch.Tensor): tensor de entrada.
+    dim (int): dimensão ao longo da qual inverter.
+
+  Returns:
+    torch.Tensor: tensor com a ordem dos elementos invertida na dimensão `dim`.
+  """
+  xsize = x.size()
     dim = x.dim() + dim if dim < 0 else dim
     x = x.contiguous()
     x = x.view(-1, *xsize[dim:])
@@ -17,16 +43,38 @@ def flip(x, dim):
 
 
 def sinc(band,t_right):
-    y_right= torch.sin(2*math.pi*band*t_right)/(2*math.pi*band*t_right)
-    y_left= flip(y_right,0)
+  """Gera um kernel sinc centrado na frequência `band`.
 
-    y=torch.cat([y_left,Variable(torch.ones(1)).cuda(),y_right])
+  O kernel é construído para a metade direita (`t_right`) e espelhado para formar
+  o kernel completo (valores à esquerda e à direita) com um pico central.
 
-    return y
+  Args:
+    band (float or torch.Tensor): frequência (ou vetor de frequências) do filtro.
+    t_right (torch.Tensor): instantes de tempo positivos para a metade direita do kernel.
+
+  Returns:
+    torch.Tensor: kernel sinc concatenado [left, center=1, right].
+  """
+  y_right= torch.sin(2*math.pi*band*t_right)/(2*math.pi*band*t_right)
+  y_left= flip(y_right,0)
+
+  y=torch.cat([y_left,Variable(torch.ones(1)).cuda(),y_right])
+
+  return y
     
 class sinc_conv(nn.Module):
+  """Camada de convolução que usa filtros parametrizados por funções sinc.
 
-    def __init__(self, N_filt,Filt_dim,fs):
+  Cada filtro é inicializado no domínio Mel e representado por duas variáveis
+  treináveis: a frequência inicial (`filt_b1`) e a largura de banda (`filt_band`).
+
+  Args:
+    N_filt (int): número de filtros da camada.
+    Filt_dim (int): comprimento (número de amostras) de cada filtro.
+    fs (int): taxa de amostragem (Hz) usada para mapear frequências.
+  """
+
+  def __init__(self, N_filt,Filt_dim,fs):
         super(sinc_conv,self).__init__()
 
         # Mel Initialization of the filterbanks
@@ -50,8 +98,16 @@ class sinc_conv(nn.Module):
         
 
     def forward(self, x):
+      """Computa a convolução 1D entre `x` e o banco de filtros sinc.
+
+      Args:
+        x (torch.Tensor): tensor de entrada com formato [batch, 1, seq_len] ou similar.
+
+      Returns:
+        torch.Tensor: saída convoluída com `N_filt` canais.
+      """
         
-        filters=Variable(torch.zeros((self.N_filt,self.Filt_dim))).cuda()
+      filters=Variable(torch.zeros((self.N_filt,self.Filt_dim))).cuda()
         N=self.Filt_dim
         t_right=Variable(torch.linspace(1, (N-1)/2, steps=int((N-1)/2))/self.fs).cuda()
         
@@ -85,9 +141,18 @@ class sinc_conv(nn.Module):
     
 
 def act_fun(act_type):
+ """Retorna uma função de ativação PyTorch a partir de uma string.
+
+Args:
+  act_type (str): nome da ativação. Suportados: 'relu','tanh','sigmoid',
+          'leaky_relu','elu','softmax','linear'.
+
+Returns:
+  torch.nn.Module: instância da função de ativação.
+"""
 
  if act_type=="relu":
-    return nn.ReLU()
+  return nn.ReLU()
             
  if act_type=="tanh":
     return nn.Tanh()
@@ -109,8 +174,14 @@ def act_fun(act_type):
     return nn.LeakyReLU(1) # initializzed like this, but not used in forward!
             
 class LayerNorm(nn.Module):
+  """Implementação simples de Layer Normalization com parâmetros treináveis.
 
-    def __init__(self, features, eps=1e-6):
+  Args:
+    features (int): número de features (última dimensão) a normalizar.
+    eps (float): pequeno valor para estabilidade numérica.
+  """
+
+  def __init__(self, features, eps=1e-6):
         super(LayerNorm,self).__init__()
         self.gamma = nn.Parameter(torch.ones(features))
         self.beta = nn.Parameter(torch.zeros(features))
@@ -125,8 +196,17 @@ class LayerNorm(nn.Module):
 class MLP(nn.Module):
     def __init__(self, options):
         super(MLP, self).__init__()
-        
-        self.input_dim=int(options['input_dim'])
+    """Perceptron multicamada configurável via dicionário `options`.
+
+    O dicionário `options` deve conter as chaves usadas no construtor, por
+    exemplo: 'input_dim', 'fc_lay', 'fc_drop', 'fc_use_batchnorm',
+    'fc_use_laynorm', 'fc_use_laynorm_inp', 'fc_use_batchnorm_inp', 'fc_act'.
+
+    Args:
+      options (dict): configurações da MLP (valores típicos vêm do arquivo de cfg).
+    """
+
+    self.input_dim=int(options['input_dim'])
         self.fc_lay=options['fc_lay']
         self.fc_drop=options['fc_drop']
         self.fc_use_batchnorm=options['fc_use_batchnorm']
@@ -189,7 +269,15 @@ class MLP(nn.Module):
          
          
     def forward(self, x):
-        
+        """Propaga `x` através das camadas fully-connected configuradas.
+
+        Args:
+            x (torch.Tensor): tensor de entrada com shape [..., input_dim].
+
+        Returns:
+            torch.Tensor: saída processada pela MLP.
+        """
+
       # Applying Layer/Batch Norm
       if bool(self.fc_use_laynorm_inp):
         x=self.ln0((x))
@@ -228,6 +316,14 @@ class SincNet(nn.Module):
     
     def __init__(self,options):
        super(SincNet,self).__init__()
+     """Rede convolucional baseada em SincNet para extração de features de áudio.
+
+     Recebe um dicionário `options` com as configurações das camadas CNN
+     (números e tamanhos de filtros, funções de ativação, normalizações, etc.).
+
+     Args:
+       options (dict): configurações que normalmente vêm de um arquivo .cfg.
+     """
     
        self.cnn_N_filt=options['cnn_N_filt']
        self.cnn_len_filt=options['cnn_len_filt']

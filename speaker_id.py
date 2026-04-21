@@ -1,26 +1,24 @@
-# speaker_id.py
-# ------------------
-# Created by
-# Mirco Ravanelli 
-# Mila - University of Montreal 
+"""Script de treinamento para identificação de locutor usando SincNet.
 
-# July 2018
-# ------------------
-# Modified by
-# João Antônio Chagas Nunes
-# Universidade Federal de Pernambuco
+Este script implementa o fluxo completo de treino e avaliação para um
+experimento de identificação de locutor baseado em SincNet. Principais
+componentes:
 
-# Add AM-Softmax loss function
-# December 2018
-# ------------------
+- Leitura de configuração a partir de um arquivo `.cfg` (ver `cfg/`).
+- Construção da rede: `SincNet` (extração de features) seguida por duas
+    MLPs (`DNN1` e `DNN2`) para classificação.
+- Função de perda opcional `AdditiveMarginSoftmax` (AM-Softmax).
+- Loop de treino por épocas com avaliação periódica e salvamento de checkpoints.
 
-# Description: 
-# This code performs a speaker_id experiments with SincNet.
- 
-# How to run it:
-# python speaker_id.py --cfg=cfg/SincNet_TIMIT.cfg
+Uso:
+        python speaker_id.py --cfg=cfg/SincNet_TIMIT.cfg
 
-#
+Nota: este arquivo depende de `dnn_models.py` e `data_io.py` no mesmo pacote.
+"""
+
+# Original authors:
+#   Mirco Ravanelli (MILA, 2018)
+#   João Antônio Chagas Nunes (UFPE) - adições AM-Softmax (2018)
 
 import os
 #import scipy.io.wavfile
@@ -39,49 +37,85 @@ from data_io import ReadList,read_conf,str_to_bool
 
 
 def create_batches_rnd(batch_size,data_folder,wav_lst,N_snt,wlen,lab_dict,fact_amp):
-    
+    """Cria um minibatch com segmentos de áudio aleatórios.
+
+    Esta função seleciona `batch_size` sentenças aleatórias da lista `wav_lst`,
+    extrai um segmento com comprimento `wlen` de cada sentença, aplica uma
+    amplificação aleatória no intervalo definido por `fact_amp` e retorna
+    tensores PyTorch prontos para GPU com os sinais e rótulos correspondentes.
+
+    Args:
+        batch_size (int): número de exemplos no minibatch.
+        data_folder (str): pasta base onde os arquivos de áudio estão armazenados.
+        wav_lst (list): lista de caminhos relativos para arquivos de áudio.
+        N_snt (int): número total de sentenças em `wav_lst`.
+        wlen (int): comprimento do segmento em amostras.
+        lab_dict (dict): mapeamento de nome_arquivo -> índice de classe.
+        fact_amp (float): variação percentual na amplitude (ex.: 0.2 para ±20%).
+
+    Returns:
+        tuple: `(inp, lab)` onde `inp` é um `torch.Tensor` em CUDA com shape
+               `[batch_size, wlen]` e `lab` é um tensor de rótulos `long`.
+    """
+
     # Initialization of the minibatch (batch_size,[0=>x_t,1=>x_t+N,1=>random_samp])
     sig_batch=np.zeros([batch_size,wlen])
     lab_batch=np.zeros(batch_size)
-  
+
     snt_id_arr=np.random.randint(N_snt, size=batch_size)
- 
+
     rand_amp_arr = np.random.uniform(1.0-fact_amp,1+fact_amp,batch_size)
 
     for i in range(batch_size):
-     
-        # select a random sentence from the list
-        #[fs,signal]=scipy.io.wavfile.read(data_folder+wav_lst[snt_id_arr[i]])
-        #signal=signal.astype(float)/32768
 
+        # select a random sentence from the list
         [signal, fs] = sf.read(data_folder+wav_lst[snt_id_arr[i]])
 
-        # accesing to a random chunk
+        # accessing a random chunk
         snt_len=signal.shape[0]
         snt_beg=np.random.randint(snt_len-wlen-1) #randint(0, snt_len-2*wlen-1)
         snt_end=snt_beg+wlen
-  
+
         sig_batch[i,:]=signal[snt_beg:snt_end]*rand_amp_arr[i]
         lab_batch[i]=lab_dict[wav_lst[snt_id_arr[i]]]
-  
+
     inp=Variable(torch.from_numpy(sig_batch).float().cuda().contiguous())
     lab=Variable(torch.from_numpy(lab_batch).float().cuda().contiguous())
-  
+
     return inp,lab
 
 class AdditiveMarginSoftmax(nn.Module):
-    # AMSoftmax
+    """Implementação simples do AM-Softmax (Additive Margin Softmax).
+
+    AM-Softmax aplica uma margem aditiva `m` sobre o cosseno da classe correta
+    antes de escalar por `s` e computar a perda log-softmax. Esta versão espera
+    `predicted` como logits de cosseno (ou vetores que serão normalizados).
+
+    Args:
+        margin (float): margem aditiva `m` aplicada ao cosseno da classe correta.
+        s (float): fator de escala aplicado após a margem.
+    """
+
     def __init__(self, margin=0.35, s=30):
         super().__init__()
 
-        self.m = margin #
+        self.m = margin
         self.s = s
-        self.epsilon = 0.000000000001
+        self.epsilon = 1e-12
         print('AMSoftmax m = ' + str(margin))
 
     def forward(self, predicted, target):
+        """Calcula a perda AM-Softmax.
 
-        # ------------ AM Softmax ------------ #
+        Args:
+            predicted (torch.Tensor): logits de saída do classificador, shape [N, C].
+            target (torch.Tensor): rótulos inteiros, shape [N].
+
+        Returns:
+            torch.Tensor: escalar contendo a perda média.
+        """
+
+        # Normalize predicted vectors by L2 norm (per-sample)
         predicted = predicted / (predicted.norm(p=2, dim=0) + self.epsilon)
         indexes = range(predicted.size(0))
         cos_theta_y = predicted[indexes, target]
